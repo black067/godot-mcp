@@ -3,12 +3,13 @@ extends EditorPlugin
 
 ## godot-mcp EditorPlugin 入口
 ##
-## 通过菜单手动控制 MCP Server：
-##   项目 → MCP Server: Start / MCP Server: Stop
-## 而非在启用插件时自动启动，方便调试。
+## 通过 项目 → MCP Server 菜单项手动控制开关（Toggle）。
+## 端口在 项目设置 → godot_mcp/port 中配置，默认为 8765。
 
 const DEFAULT_PORT := 8765
 const POLL_INTERVAL := 0.05
+const MENU_LABEL_START := "MCP Server: Start"
+const MENU_LABEL_STOP  := "MCP Server: Stop"
 
 var _server: TCPServer = null
 var _poll_timer: Timer = null
@@ -17,19 +18,44 @@ var _running := false
 
 
 func _enter_tree() -> void:
-	add_tool_menu_item("MCP Server: Start", _start_server)
-	add_tool_menu_item("MCP Server: Stop", _stop_server)
+	_define_project_settings()
+	# 初始状态：未运行，显示 Start
+	add_tool_menu_item(MENU_LABEL_START, _toggle_server)
 
 
 func _exit_tree() -> void:
-	remove_tool_menu_item("MCP Server: Start")
-	remove_tool_menu_item("MCP Server: Stop")
+	_remove_menu_silent(MENU_LABEL_START)
+	_remove_menu_silent(MENU_LABEL_STOP)
 	_stop_server()
 
 
-func _start_server() -> void:
+# ---- 项目设置 ----
+
+func _define_project_settings() -> void:
+	var name := "godot_mcp/port"
+	if not ProjectSettings.has_setting(name):
+		ProjectSettings.set_setting(name, DEFAULT_PORT)
+		ProjectSettings.set_initial_value(name, DEFAULT_PORT)
+	ProjectSettings.add_property_info({
+		"name": name,
+		"type": TYPE_INT,
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1024,65535,1",
+	})
+	ProjectSettings.set_as_basic(name, true)
+
+
+# ---- Toggle 控制 ----
+
+func _toggle_server() -> void:
 	if _running:
-		print("[godot-mcp] 已在运行中")
+		stop()
+	else:
+		start()
+
+
+func start() -> void:
+	if _running:
 		return
 
 	var port := _get_configured_port()
@@ -51,13 +77,19 @@ func _start_server() -> void:
 	_poll_timer.start()
 
 	_running = true
+	_swap_menu_label()
 	print("[godot-mcp] 已在 127.0.0.1:%d 启动" % port)
 
 
-func _stop_server() -> void:
+func stop() -> void:
 	if not _running:
 		return
+	_stop_server()
+	_swap_menu_label()
+	print("[godot-mcp] 已停止")
 
+
+func _stop_server() -> void:
 	if _poll_timer:
 		_poll_timer.stop()
 		_poll_timer.queue_free()
@@ -72,8 +104,24 @@ func _stop_server() -> void:
 		_server = null
 
 	_running = false
-	print("[godot-mcp] 已停止")
 
+
+func _swap_menu_label() -> void:
+	if _running:
+		remove_tool_menu_item(MENU_LABEL_START)
+		add_tool_menu_item(MENU_LABEL_STOP, _toggle_server)
+	else:
+		remove_tool_menu_item(MENU_LABEL_STOP)
+		add_tool_menu_item(MENU_LABEL_START, _toggle_server)
+
+
+func _remove_menu_silent(label: String) -> void:
+	# remove_tool_menu_item 在 item 不存在时会报错，这里静默处理
+	if not label.is_empty():
+		remove_tool_menu_item(label)
+
+
+# ---- Poll ----
 
 func _on_poll() -> void:
 	if not _server or not _mcp:
@@ -87,6 +135,8 @@ func _on_poll() -> void:
 	if _mcp.has_method("poll"):
 		_mcp.poll()
 
+
+# ---- 端口获取 ----
 
 func _get_configured_port() -> int:
 	if ProjectSettings.has_setting("godot_mcp/port"):
