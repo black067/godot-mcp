@@ -1,10 +1,8 @@
 {
   "servers": {
     "godot": {
-      "type": "stdio",
       "command": "node",
-      "args": ["bridge/bridge.mjs"],
-      "cwd": "${workspaceFolder}"
+      "args": ["addons/godot-mcp/bridge/bridge.mjs"]
     }
   }
 }

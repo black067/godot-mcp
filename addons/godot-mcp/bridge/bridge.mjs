@@ -20,7 +20,7 @@
  *   - Godot 断线：回退到 godot_status → 通知 VS Code 刷新。
  *
  * 用法：
- *   node bridge/bridge.mjs [--port 8765]
+ *   node addons/godot-mcp/bridge/bridge.mjs [--port 8765]
  */
 
 import { createInterface } from "node:readline";
@@ -407,5 +407,3 @@ function shutdown() {
   if (godotSocket) { godotSocket.destroy(); godotSocket = null; }
   process.exit(0);
 }
-
-main();

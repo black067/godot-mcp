@@ -11,6 +11,7 @@ const POLL_INTERVAL := 0.05
 const MENU_LABEL_START := "MCP Server: Start"
 const MENU_LABEL_STOP  := "MCP Server: Stop"
 const MENU_PICK_UI     := "Pick UI Control Path"
+const MENU_SETUP_VSCODE := "Setup VS Code MCP"
 
 var _server: TCPServer = null
 var _poll_timer: Timer = null
@@ -24,12 +25,15 @@ func _enter_tree() -> void:
 	add_tool_menu_item(MENU_LABEL_START, _toggle_server)
 	# 手动拾取 UI 控件路径（无需 MCP Server 运行）
 	add_tool_menu_item(MENU_PICK_UI, _pick_ui_control)
+	# 自动配置 VS Code MCP 连接
+	add_tool_menu_item(MENU_SETUP_VSCODE, _setup_vscode_mcp)
 
 
 func _exit_tree() -> void:
 	_remove_menu_silent(MENU_LABEL_START)
 	_remove_menu_silent(MENU_LABEL_STOP)
 	_remove_menu_silent(MENU_PICK_UI)
+	_remove_menu_silent(MENU_SETUP_VSCODE)
 	_stop_server()
 
 
@@ -167,3 +171,41 @@ func _pick_ui_control() -> void:
 		func():
 			print("[godot-mcp] 拾取已取消")
 	)
+
+
+# ---- 自动配置 VS Code MCP 连接 ----
+
+func _setup_vscode_mcp() -> void:
+	var base := ProjectSettings.globalize_path("res://")
+	var vscode_dir := base.path_join(".vscode")
+	var mcp_path := vscode_dir.path_join("mcp.json")
+
+	# 若文件已存在，提示用户手动操作
+	if FileAccess.file_exists(mcp_path):
+		var hint := '{\n  "servers": {\n    "godot": {\n      "command": "node",\n      "args": ["addons/godot-mcp/bridge/bridge.mjs"]\n    }\n  }\n}'
+		DisplayServer.clipboard_set(hint)
+		print("[godot-mcp] .vscode/mcp.json 已存在。已将 godot 条目复制到剪贴板，请手动合并到现有配置中。")
+		OS.alert(".vscode/mcp.json 已存在。\n\n已将 godot 条目复制到剪贴板，请手动合并到现有 mcp.json 中。", "godot-mcp")
+		return
+
+	# 创建 .vscode 目录
+	DirAccess.make_dir_recursive_absolute(vscode_dir)
+
+	# 写入 mcp.json
+	var config := {
+		"servers": {
+			"godot": {
+				"command": "node",
+				"args": ["addons/godot-mcp/bridge/bridge.mjs"],
+			}
+		}
+	}
+	var f := FileAccess.open(mcp_path, FileAccess.WRITE)
+	if not f:
+		push_error("[godot-mcp] 无法创建 " + mcp_path)
+		return
+	f.store_string(JSON.stringify(config, "  ") + "\n")
+	f.close()
+
+	print("[godot-mcp] 已创建 .vscode/mcp.json")
+	OS.alert("已创建 .vscode/mcp.json\n\n请在 VS Code 中重新加载窗口以激活 MCP 连接。", "godot-mcp")
