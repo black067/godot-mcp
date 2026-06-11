@@ -17,6 +17,8 @@ signal picked(path: String)
 signal cancelled()
 
 var _base: Control
+var _hovered_rect: Rect2 = Rect2()
+var _highlight_color := Color(1.0, 0.8, 0.0, 0.7)  # 金黄色描边
 
 
 static func create(base: Control, on_picked: Callable, on_cancelled: Callable = Callable()) -> PickerOverlay:
@@ -53,6 +55,17 @@ func _ready() -> void:
 
 
 func _on_gui_input(event: InputEvent) -> void:
+	# 鼠标移动 → 更新悬停高亮
+	if event is InputEventMouseMotion:
+		var mm := event as InputEventMouseMotion
+		var target := _find_deepest_control_at(_base, mm.global_position, [self])
+		if target and target != self:
+			_hovered_rect = target.get_global_rect()
+		else:
+			_hovered_rect = Rect2()
+		queue_redraw()
+		return
+
 	if not (event is InputEventMouseButton):
 		return
 	var mb := event as InputEventMouseButton
@@ -73,6 +86,15 @@ func _on_gui_input(event: InputEvent) -> void:
 	else:
 		cancelled.emit()
 	queue_free()
+
+
+func _draw() -> void:
+	"""绘制悬停控件的金色描边。"""
+	if _hovered_rect.size.x <= 0:
+		return
+	var local_pos := _hovered_rect.position - global_position
+	var local_rect := Rect2(local_pos, _hovered_rect.size)
+	draw_rect(local_rect, _highlight_color, false, 2.0)
 
 
 func _find_deepest_control_at(root: Control, pos: Vector2, exclude: Array[Control] = []) -> Control:
