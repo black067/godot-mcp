@@ -16,6 +16,13 @@ const PROTOCOL_VERSION := "2025-03-26"
 # 客户端列表：{ peer: StreamPeerTCP, buffer: String }
 var _clients: Array = []
 
+# 延迟响应：{ request_id: { peer: StreamPeerTCP, id: Variant } }
+var _pending_requests: Dictionary = {}
+var _next_pending_key: int = 0
+
+# 当前正在处理的客户端 peer（用于延迟响应）
+var _current_peer: StreamPeerTCP = null
+
 
 # ============================================================================
 # Public API（供 plugin.gd 调用）
@@ -50,6 +57,7 @@ func poll() -> void:
 
 
 func teardown() -> void:
+	_cancel_pending_requests()
 	for client in _clients:
 		var peer: StreamPeerTCP = client.peer
 		if is_instance_valid(peer):
@@ -86,7 +94,9 @@ func _process_buffer(client: Dictionary) -> void:
 		var json := JSON.new()
 		var err := json.parse(body)
 		if err == OK:
+			_current_peer = client.peer
 			var response := _dispatch(json.data)
+			_current_peer = null
 			if not response.is_empty():
 				_send(client.peer, JSON.stringify(response))
 		else:
@@ -174,6 +184,12 @@ func _list_tools() -> Array:
 				},
 				"required": ["pattern"],
 			},
+		},
+		{
+			"name": "pick_ui_element",
+			"description": "启用 UI 拾取模式：调用后在 Godot 编辑器中点击任意控件，自动将其 path 复制到剪贴板并返回。" +
+				"用于快速获取控件的精确定位路径，无需手动搜索。点击后自动退出拾取模式。",
+			"inputSchema": {"type": "object", "properties": {}},
 		},
 		{
 			"name": "screenshot",
@@ -310,6 +326,8 @@ func _call_tool(id, params: Dictionary) -> Dictionary:
 			return _tool_get_editor_ui_tree(id, arguments)
 		"find_editor_ui_element":
 			return _tool_find_editor_ui_element(id, arguments)
+		"pick_ui_element":
+			return _tool_pick_ui_element(id, arguments)
 		"screenshot":
 			return _tool_screenshot(id, arguments)
 
@@ -498,6 +516,32 @@ func _find_controls(ctrl: Control, pattern: String, filter_class: String, path: 
 		if child is Control:
 			_find_controls(child, pattern, filter_class, child_path, out_results)
 
+
+# ---- UI 拾取工具（点击任意控件复制路径） ----
+
+func _tool_pick_ui_element(id, args: Dictionary) -> Dictionary:
+	var base := EditorInterface.get_base_control()
+	if not base:
+		return _tool_err(id, "无法获取编辑器 UI 根节点。")
+
+	if not _current_peer:
+		return _tool_err(id, "内部错误：无法获取客户端连接。")
+
+	# 注册延迟响应
+	var pending_key := _defer_response(_current_peer, id)
+
+	# 使用 PickerOverlay 工厂方法
+	PickerOverlay.create(base,
+		func(path_str: String):
+			DisplayServer.clipboard_set(path_str)
+			_send_deferred_ok(pending_key, "[已复制到剪贴板] " + path_str),
+		func():
+			_send_deferred_err(pending_key, "拾取已取消（右键点击）")
+	)
+
+	return {}  # 延迟响应
+
+
 func _mk_resp(id, result) -> Dictionary:
 	return {"jsonrpc": "2.0", "id": id, "result": result}
 
@@ -518,6 +562,43 @@ func _tool_err(id, message: String) -> Dictionary:
 		"content": [{"type": "text", "text": message}],
 		"isError": true,
 	})
+
+
+# ============================================================================
+# 延迟响应：支持需要用户交互才能完成的工具（如 pick_ui_element）
+# ============================================================================
+
+func _defer_response(peer: StreamPeerTCP, id) -> int:
+	"""注册延迟响应，返回 pending_key。工具返回 {} 表示稍后响应。"""
+	var key := _next_pending_key
+	_next_pending_key += 1
+	_pending_requests[key] = {"peer": peer, "id": id}
+	return key
+
+
+func _send_deferred_ok(pending_key: int, text: String) -> void:
+	"""发送延迟成功响应并清理。"""
+	if not _pending_requests.has(pending_key):
+		return
+	var req = _pending_requests[pending_key]
+	_pending_requests.erase(pending_key)
+	_send(req.peer, JSON.stringify(_tool_ok(req.id, text)))
+
+
+func _send_deferred_err(pending_key: int, message: String) -> void:
+	"""发送延迟错误响应并清理。"""
+	if not _pending_requests.has(pending_key):
+		return
+	var req = _pending_requests[pending_key]
+	_pending_requests.erase(pending_key)
+	_send(req.peer, JSON.stringify(_tool_err(req.id, message)))
+
+
+func _cancel_pending_requests() -> void:
+	"""清理所有未完成的延迟请求。"""
+	for req in _pending_requests.values():
+		_send(req.peer, JSON.stringify(_tool_err(req.id, "请求已取消（服务器关闭）")))
+	_pending_requests.clear()
 
 
 # ============================================================================
@@ -557,7 +638,7 @@ func _resolve_control_by_path(path_str: String) -> Control:
 # ============================================================================
 
 func _get_editor_viewport() -> Viewport:
-	## 获取当前活跃的编辑器视口 (2D 或 3D)。
+	## 获取当前活跃的编辑器场景视口 (2D 或 3D)。仅用于截图。
 	var vp := EditorInterface.get_editor_viewport_2d()
 	if vp:
 		return vp
@@ -567,8 +648,16 @@ func _get_editor_viewport() -> Viewport:
 	return EditorInterface.get_base_control().get_viewport()
 
 
+func _get_main_viewport() -> Viewport:
+	## 获取编辑器主窗口视口。用于 UI 交互（点击控件、按键等）。
+	var base := EditorInterface.get_base_control()
+	if base:
+		return base.get_viewport()
+	return null
+
+
 func _simulate_mouse_click(global_pos: Vector2, button: String, double_click: bool) -> void:
-	var vp := _get_editor_viewport()
+	var vp := _get_main_viewport()
 	if not vp:
 		return
 
@@ -611,7 +700,7 @@ func _simulate_mouse_click(global_pos: Vector2, button: String, double_click: bo
 
 
 func _simulate_mouse_move(global_pos: Vector2) -> void:
-	var vp := _get_editor_viewport()
+	var vp := _get_main_viewport()
 	if not vp:
 		return
 
@@ -623,7 +712,7 @@ func _simulate_mouse_move(global_pos: Vector2) -> void:
 
 func _simulate_key_char(ch: String) -> void:
 	## 发送单个字符的按键事件。
-	var vp := _get_editor_viewport()
+	var vp := _get_main_viewport()
 	if not vp:
 		return
 
@@ -728,7 +817,7 @@ func _parse_key_combo(key: String) -> Dictionary:
 
 func _simulate_key_combo(key: String) -> void:
 	var parsed := _parse_key_combo(key)
-	var vp := _get_editor_viewport()
+	var vp := _get_main_viewport()
 	if not vp:
 		return
 
@@ -862,12 +951,36 @@ func _tool_run_gdscript(id, args: Dictionary) -> Dictionary:
 	if code.is_empty():
 		return _tool_err(id, "缺少必填参数 code")
 
+	# 阶段 1：无命名输入 → 全局作用域完整（可访问 GDScript/FileAccess 等全局类）
 	var expr := Expression.new()
 	var err := expr.parse(code, [])
+	if err == OK:
+		var result = expr.execute([], EditorInterface)
+		if not expr.has_execute_failed():
+			if typeof(result) == TYPE_OBJECT:
+				return _tool_ok(id, str(result))
+			return _tool_ok(id, str(result))
+
+	# 阶段 2：加入命名输入 → 可访问编辑器单例和全局类（回退方案）
+	var input_names: Array[StringName] = [
+		&"EditorInterface", &"ProjectSettings", &"OS", &"Engine",
+		&"DisplayServer", &"Input", &"Time", &"ResourceLoader",
+		&"ResourceSaver", &"ClassDB",
+		# 全局类引用
+		&"GDScript", &"FileAccess", &"DirAccess",
+	]
+	var input_values: Array = [
+		EditorInterface, ProjectSettings, OS, Engine,
+		DisplayServer, Input, Time, ResourceLoader,
+		ResourceSaver, ClassDB,
+		GDScript, FileAccess, DirAccess,
+	]
+	expr = Expression.new()
+	err = expr.parse(code, input_names)
 	if err != OK:
 		return _tool_err(id, "解析错误: %s (第 %d 行)" % [expr.get_error_text(), expr.get_error_line()])
 
-	var result = expr.execute([], null)
+	var result = expr.execute(input_values, EditorInterface)
 	if expr.has_execute_failed():
 		return _tool_err(id, "执行错误: " + expr.get_error_text())
 
@@ -914,7 +1027,7 @@ func _tool_drag_element(id, args: Dictionary) -> Dictionary:
 	var from_center := from_ctrl.get_global_rect().position + from_ctrl.get_global_rect().size / 2.0
 	var to_center := to_ctrl.get_global_rect().position + to_ctrl.get_global_rect().size / 2.0
 
-	var vp := _get_editor_viewport()
+	var vp := _get_main_viewport()
 	if not vp:
 		return _tool_err(id, "无法获取编辑器视口")
 

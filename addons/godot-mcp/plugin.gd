@@ -10,6 +10,7 @@ const DEFAULT_PORT := 8765
 const POLL_INTERVAL := 0.05
 const MENU_LABEL_START := "MCP Server: Start"
 const MENU_LABEL_STOP  := "MCP Server: Stop"
+const MENU_PICK_UI     := "Pick UI Control Path"
 
 var _server: TCPServer = null
 var _poll_timer: Timer = null
@@ -21,11 +22,14 @@ func _enter_tree() -> void:
 	_define_project_settings()
 	# 初始状态：未运行，显示 Start
 	add_tool_menu_item(MENU_LABEL_START, _toggle_server)
+	# 手动拾取 UI 控件路径（无需 MCP Server 运行）
+	add_tool_menu_item(MENU_PICK_UI, _pick_ui_control)
 
 
 func _exit_tree() -> void:
 	_remove_menu_silent(MENU_LABEL_START)
 	_remove_menu_silent(MENU_LABEL_STOP)
+	_remove_menu_silent(MENU_PICK_UI)
 	_stop_server()
 
 
@@ -144,3 +148,22 @@ func _get_configured_port() -> int:
 		if typeof(p) == TYPE_INT and p > 0 and p < 65536:
 			return p
 	return DEFAULT_PORT
+
+
+# ---- 手动拾取 UI 控件路径（菜单入口） ----
+
+func _pick_ui_control() -> void:
+	var base := EditorInterface.get_base_control()
+	if not base:
+		push_error("[godot-mcp] 无法获取编辑器 UI 根节点。")
+		return
+
+	print("[godot-mcp] 进入 UI 拾取模式：左键点击控件获取路径，右键取消")
+
+	PickerOverlay.create(base,
+		func(path_str: String):
+			DisplayServer.clipboard_set(path_str)
+			print("[godot-mcp] 已复制到剪贴板: " + path_str),
+		func():
+			print("[godot-mcp] 拾取已取消")
+	)
