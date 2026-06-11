@@ -3,18 +3,21 @@
 /**
  * godot-mcp Bridge — Node.js 智能 MCP 桥接代理
  *
- * 职责：
+ * 架构原则：
+ *   Godot 是工具的唯一权威来源。Bridge 不硬编码任何 Godot 工具定义，
+ *   只负责：缓存工具列表 + 透明转发 + 连接状态管理。
+ *
  *   VS Code 端（stdio）：以子进程方式被 VS Code MCP Client 启动，通过
  *   stdin/stdout 收发 newline-delimited JSON-RPC 2.0 消息。
  *
  *   Godot 端（TCP）：连接到 Godot 编辑器中运行的 godot-mcp EditorPlugin
- *   （默认 127.0.0.1:8765），使用 Content-Length 头帧格式收发 JSON-RPC 消息。
+ *   （默认 127.0.0.1:8765），使用 Content-Length 头帧格式。
  *
  * 智能代理模式：
- *   - 当 Godot 未运行时，bridge 自行响应 initialize / ping / tools/list，
- *     避免 VS Code 报 "Server 启动失败"。
- *   - 当 Agent 调用工具但 Godot 不在线时，返回友好错误提示用户打开 Godot。
- *   - 当 Godot 上线后，bridge 自动切换为"转发模式"。
+ *   - Godot 离线：返回缓存的工具列表（首次仅含 godot_status 元工具），
+ *     tools/call 返回友好错误引导用户打开 Godot。
+ *   - Godot 上线：后台拉取真实工具列表 → 更新缓存 → 通知 VS Code 刷新。
+ *   - Godot 断线：回退到 godot_status → 通知 VS Code 刷新。
  *
  * 用法：
  *   node bridge/bridge.mjs [--port 8765]
@@ -23,15 +26,14 @@
 import { createInterface } from "node:readline";
 import { connect } from "node:net";
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // 配置
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 const DEFAULT_PORT = 8765;
 const GODOT_HOST = "127.0.0.1";
-const RECONNECT_INTERVAL_MS = 3000; // Godot 断线后重试间隔
+const RECONNECT_INTERVAL_MS = 3000;
 
-// 从命令行参数解析端口
 function parsePort(args) {
   const portIdx = args.indexOf("--port");
   if (portIdx !== -1 && portIdx + 1 < args.length) {
@@ -43,281 +45,73 @@ function parsePort(args) {
 
 const PORT = parsePort(process.argv.slice(2));
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // 状态
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /** @type {import("node:net").Socket | null} */
 let godotSocket = null;
-let godotBuffer = ""; // TCP 流拼接缓冲区
+/** @type {Buffer} */
+let godotBuffer = Buffer.alloc(0);
 let reconnectTimer = null;
 let shuttingDown = false;
-let wasConnected = false; // 是否曾成功连接过（用于区分"从未连上"和"连上后断开"）
+let wasConnected = false;
 
-// ---------------------------------------------------------------------------
-// 离线工具列表（与 Godot 插件保持一致的工具签名）
-// 当 Godot 不在线时，tools/list 返回此列表，确保 Agent 提前知道所有工具能力
-// ---------------------------------------------------------------------------
+// ---- 工具缓存：Godot 是唯一权威，bridge 只缓存 + 转发 ----
 
-const OFFLINE_TOOLS = [
+let _internalId = 0;
+/** @type {Map<string, (msg: object) => void>} */
+const _internalCallbacks = new Map();
+
+/** bridge 唯一自维护的元工具 */
+const META_TOOLS = [
   {
-    name: "get_editor_ui_tree",
+    name: "godot_status",
     description:
-      "获取 Godot 编辑器 UI 树结构（菜单栏、面板、Inspector 等所有 Control 节点）。需要 Godot 编辑器已打开并启用 godot-mcp 插件。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        max_depth: {
-          type: "integer",
-          description: "最大遍历深度，默认 10",
-          default: 10,
-        },
-        include_hidden: {
-          type: "boolean",
-          description: "是否包含隐藏节点，默认 false",
-          default: false,
-        },
-      },
-    },
-  },
-  {
-    name: "find_ui_element",
-    description:
-      "在编辑器 UI 中按名称/类名/文本模糊搜索 Control 节点。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        pattern: {
-          type: "string",
-          description: "搜索模式（支持通配符 *）",
-        },
-        filter_class: {
-          type: "string",
-          description: "可选：按类名过滤（如 Button、LineEdit）",
-        },
-      },
-      required: ["pattern"],
-    },
-  },
-  {
-    name: "get_scene_tree",
-    description:
-      "获取当前编辑场景的完整节点树结构。需要 Godot 编辑器已打开且有一个打开的场景。",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "get_node_properties",
-    description: "获取指定场景节点的所有属性。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        node_path: {
-          type: "string",
-          description: "节点路径（相对于场景根节点）",
-        },
-      },
-      required: ["node_path"],
-    },
-  },
-  {
-    name: "set_node_property",
-    description:
-      "修改指定场景节点的属性值（通过 EditorUndoRedoManager 可撤销）。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        node_path: {
-          type: "string",
-          description: "节点路径（相对于场景根节点）",
-        },
-        property: {
-          type: "string",
-          description: "属性名",
-        },
-        value: {
-          description: "新属性值（类型由属性决定）",
-        },
-      },
-      required: ["node_path", "property", "value"],
-    },
-  },
-  {
-    name: "get_selected_nodes",
-    description:
-      "获取当前在编辑器中选中的节点列表。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "select_node",
-    description:
-      "在场景树中选中指定节点。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        node_path: {
-          type: "string",
-          description: "要选中的节点路径",
-        },
-      },
-      required: ["node_path"],
-    },
-  },
-  {
-    name: "play_current_scene",
-    description:
-      "运行当前编辑的场景。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "stop_playing_scene",
-    description:
-      "停止当前正在运行的场景。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "get_editor_viewport_screenshot",
-    description:
-      "截取 2D/3D 编辑器视口的当前画面，返回 base64 编码的 PNG 图片。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        viewport_type: {
-          type: "string",
-          enum: ["2d", "3d"],
-          description: "视口类型：2d 或 3d",
-          default: "2d",
-        },
-      },
-    },
-  },
-  {
-    name: "edit_script",
-    description:
-      "在 Godot 编辑器中打开指定脚本文件到指定行。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        script_path: {
-          type: "string",
-          description: "脚本文件路径（相对于项目根目录，如 res://player.gd）",
-        },
-        line: {
-          type: "integer",
-          description: "跳转到指定行号",
-        },
-      },
-      required: ["script_path"],
-    },
-  },
-  {
-    name: "get_filesystem_tree",
-    description:
-      "获取项目文件系统树结构。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "目录路径（默认为 res://）",
-          default: "res://",
-        },
-      },
-    },
-  },
-  {
-    name: "click_editor_button",
-    description:
-      "根据文本/类名在编辑器 UI 中查找并点击按钮。需要一个已打开的 Godot 编辑器。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        text: {
-          type: "string",
-          description: "按钮文本（模糊匹配）",
-        },
-        button_class: {
-          type: "string",
-          description: "可选：按钮类名过滤",
-        },
-      },
-      required: ["text"],
-    },
-  },
-  {
-    name: "set_editor_text",
-    description:
-      "在编辑器 UI 输入框中填写文本。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        field_pattern: {
-          type: "string",
-          description: "输入框名称/类名模式",
-        },
-        text: {
-          type: "string",
-          description: "要填写的文本",
-        },
-      },
-      required: ["field_pattern", "text"],
-    },
-  },
-  {
-    name: "get_editor_layout_info",
-    description:
-      "获取编辑器布局信息（面板位置、尺寸、可见性等）。需要 Godot 编辑器已打开。",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
+      "查询 Godot 编辑器的连接状态。返回是否已连接、端口、工具数量。" +
+      "当其他工具返回 'Godot 未连接' 错误时，可先调用此工具确认状态。",
+    inputSchema: { type: "object", properties: {} },
   },
 ];
 
-// ---------------------------------------------------------------------------
-// MCP 协议辅助
-// ---------------------------------------------------------------------------
+/** @type {object[]} 工具缓存（初始 META_TOOLS，Godot 上线后追加真实工具） */
+let _cachedTools = [...META_TOOLS];
 
-let nextId = 1;
-/** @type {Map<number, {resolve, reject}>} */
-const pendingRequests = new Map();
+// ============================================================================
+// JSON-RPC / MCP 辅助
+// ============================================================================
 
-function makeJsonRpcResponse(id, result) {
+function makeResponse(id, result) {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
 }
 
-function makeJsonRpcError(id, code, message, data) {
-  const err = { jsonrpc: "2.0", id, error: { code, message } };
-  if (data !== undefined) err.error.data = data;
-  return JSON.stringify(err);
+function makeError(id, code, message) {
+  return JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
-/** 返回给 Agent 的友好错误（isError: true 的 tool result，不是协议错误） */
-function makeToolErrorResult(id, message) {
+function makeNotification(method, params) {
+  return JSON.stringify({ jsonrpc: "2.0", method, params });
+}
+
+function makeToolOk(id, text) {
   return JSON.stringify({
     jsonrpc: "2.0",
     id,
-    result: {
-      content: [{ type: "text", text: message }],
-      isError: true,
-    },
+    result: { content: [{ type: "text", text }], isError: false },
   });
 }
 
-// ---------------------------------------------------------------------------
+function makeToolErr(id, message) {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    result: { content: [{ type: "text", text: message }], isError: true },
+  });
+}
+
+// ============================================================================
 // Godot 连接管理
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 function connectToGodot() {
   if (shuttingDown) return;
@@ -328,41 +122,35 @@ function connectToGodot() {
   sock.on("connect", () => {
     wasConnected = true;
     godotSocket = sock;
-    godotBuffer = "";
+    godotBuffer = Buffer.alloc(0);
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
       reconnectTimer = null;
     }
+    _fetchToolsFromGodot();
   });
 
   sock.on("data", (chunk) => {
-    godotBuffer += chunk.toString("utf-8");
-    // Content-Length 帧解析
+    godotBuffer = Buffer.concat([godotBuffer, chunk]);
+
     while (true) {
       const headerEnd = godotBuffer.indexOf("\r\n\r\n");
       if (headerEnd === -1) break;
 
-      const header = godotBuffer.substring(0, headerEnd);
-      const contentLengthMatch = header.match(/^Content-Length:\s*(\d+)/im);
-      if (!contentLengthMatch) {
-        warn("无效的 Content-Length 帧头，丢弃缓冲区");
-        godotBuffer = "";
-        break;
-      }
+      const header = godotBuffer.subarray(0, headerEnd).toString("utf-8");
+      const m = header.match(/^Content-Length:\s*(\d+)/im);
+      if (!m) { godotBuffer = Buffer.alloc(0); break; }
 
-      const contentLength = parseInt(contentLengthMatch[1], 10);
+      const contentLength = parseInt(m[1], 10);
       const bodyStart = headerEnd + 4;
       const totalNeeded = bodyStart + contentLength;
+      if (godotBuffer.length < totalNeeded) break;
 
-      if (godotBuffer.length < totalNeeded) break; // 数据不完整，等待
-
-      const body = godotBuffer.substring(bodyStart, totalNeeded);
-      godotBuffer = godotBuffer.substring(totalNeeded);
+      const body = godotBuffer.subarray(bodyStart, totalNeeded).toString("utf-8");
+      godotBuffer = godotBuffer.subarray(totalNeeded);
 
       try {
-        const msg = JSON.parse(body);
-        // Godot 发来的响应或请求，直接写到 stdout 给 VS Code
-        writeStdout(JSON.stringify(msg));
+        _onGodotMessage(JSON.parse(body));
       } catch {
         warn("收到无效 JSON 帧");
       }
@@ -370,28 +158,24 @@ function connectToGodot() {
   });
 
   sock.on("close", () => {
-    if (wasConnected) {
-      warn("Godot 连接断开，将在 " + RECONNECT_INTERVAL_MS / 1000 + " 秒后重试");
-    }
+    if (wasConnected) warn("Godot 连接断开，将在 " + RECONNECT_INTERVAL_MS / 1000 + "s 后重试");
     godotSocket = null;
-    godotBuffer = "";
+    godotBuffer = Buffer.alloc(0);
+    _onGodotDisconnected();
     scheduleReconnect();
   });
 
   sock.on("error", (err) => {
-    // ECONNREFUSED 是常态（Godot 未启动），不打印；其他错误才报告
-    if (err.code !== "ECONNREFUSED") {
-      warn("连接 Godot 时出错: " + err.message);
-    }
+    if (err.code !== "ECONNREFUSED") warn("连接 Godot 时出错: " + err.message);
     godotSocket = null;
-    godotBuffer = "";
+    godotBuffer = Buffer.alloc(0);
+    _onGodotDisconnected();
     scheduleReconnect();
   });
 }
 
 function scheduleReconnect() {
-  if (shuttingDown) return;
-  if (reconnectTimer) return;
+  if (shuttingDown || reconnectTimer) return;
   reconnectTimer = setInterval(() => {
     if (godotSocket && !godotSocket.destroyed) {
       clearInterval(reconnectTimer);
@@ -415,185 +199,189 @@ function sendToGodot(jsonStr) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// VS Code stdio 通信
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Godot → Bridge 消息处理
+// ============================================================================
+
+function _onGodotMessage(msg) {
+  const id = msg.id;
+
+  // 内部请求的响应（string id）→ 拦截
+  if (typeof id === "string" && _internalCallbacks.has(id)) {
+    const cb = _internalCallbacks.get(id);
+    _internalCallbacks.delete(id);
+    cb(msg);
+    return;
+  }
+
+  // Godot 发来的 tools/list_changed → 重新拉取
+  if (msg.method === "notifications/tools/list_changed") {
+    _fetchToolsFromGodot();
+    return;
+  }
+
+  // 其他一切直接透传给 VS Code
+  writeStdout(JSON.stringify(msg));
+}
+
+function _fetchToolsFromGodot() {
+  if (!godotSocket || godotSocket.destroyed) return;
+
+  const reqId = "_b_" + ++_internalId;
+  _internalCallbacks.set(reqId, (resp) => {
+    if (resp.result && Array.isArray(resp.result.tools)) {
+      _cachedTools = [...META_TOOLS, ...resp.result.tools];
+      writeStdout(makeNotification("notifications/tools/list_changed"));
+    }
+  });
+
+  sendToGodot(JSON.stringify({ jsonrpc: "2.0", id: reqId, method: "tools/list", params: {} }));
+}
+
+function _onGodotDisconnected() {
+  _cachedTools = [...META_TOOLS];
+  writeStdout(makeNotification("notifications/tools/list_changed"));
+}
+
+// ============================================================================
+// VS Code stdio
+// ============================================================================
 
 function writeStdout(str) {
   process.stdout.write(str + "\n");
 }
 
-/** 仅输出到 stderr 的日志——只在真正的异常/错误时才写，避免 VS Code [warning] 泛滥 */
 function warn(msg) {
   process.stderr.write("[godot-mcp] " + msg + "\n");
 }
 
-// ---------------------------------------------------------------------------
-// MCP 消息路由（来自 VS Code → bridge 处理或转发到 Godot）
-// ---------------------------------------------------------------------------
+// ============================================================================
+// VS Code → Bridge 消息路由
+// ============================================================================
 
 function handleVsCodeMessage(msg) {
   const { method, id, params } = msg;
 
-  // ---- 请求（有 id，需要响应） ----
-
-  if (id !== undefined && id !== null) {
-    switch (method) {
-      case "initialize": {
-        // 始终自响应，VS Code 不会报 Server 启动失败
-        writeStdout(
-          makeJsonRpcResponse(id, {
-            protocolVersion: "2025-03-26",
-            capabilities: {
-              tools: { listChanged: true },
-            },
-            serverInfo: {
-              name: "godot-mcp",
-              version: "0.1.0",
-            },
-            instructions:
-              "Godot MCP Bridge — 请在 Godot 编辑器中启用 godot-mcp 插件后使用工具。" +
-              (godotSocket ? " ✅ Godot 已连接。" : " ⚠️ Godot 未连接，请先打开 Godot 编辑器。"),
-          })
-        );
-        return;
-      }
-
-      case "tools/list": {
-        if (godotSocket && !godotSocket.destroyed) {
-          // 转发给 Godot 获取实时工具列表
-          sendToGodot(JSON.stringify(msg));
-        } else {
-          // Godot 不在线，返回离线工具列表
-          writeStdout(
-            makeJsonRpcResponse(id, {
-              tools: OFFLINE_TOOLS,
-            })
-          );
-        }
-        return;
-      }
-
-      case "tools/call": {
-        if (godotSocket && !godotSocket.destroyed) {
-          // Godot 在线 → 转发
-          sendToGodot(JSON.stringify(msg));
-        } else {
-          // Godot 不在线 → 返回友好错误
-          writeStdout(
-            makeToolErrorResult(
-              id,
-              "❌ 无法执行工具 **" +
-                (params?.name || "unknown") +
-                "**：Godot 编辑器未运行或 godot-mcp 插件未启用。\n\n" +
-                "请执行以下步骤：\n" +
-                "1. 打开 Godot 编辑器并载入当前项目\n" +
-                "2. 在菜单栏选择 **项目 → 项目设置 → 插件**\n" +
-                "3. 启用 **godot-mcp** 插件\n" +
-                "4. 确认插件状态栏显示绿色指示条「🤖 MCP 就绪」"
-            )
-          );
-        }
-        return;
-      }
-
-      case "ping": {
-        if (godotSocket && !godotSocket.destroyed) {
-          // 有 Godot 时转发
-          sendToGodot(JSON.stringify(msg));
-        } else {
-          // 无 Godot 时自响应
-          writeStdout(makeJsonRpcResponse(id, {}));
-        }
-        return;
-      }
-
-      default: {
-        // 其他所有请求：尝试转发给 Godot
-        if (godotSocket && !godotSocket.destroyed) {
-          sendToGodot(JSON.stringify(msg));
-        } else {
-          writeStdout(
-            makeJsonRpcError(
-              id,
-              -32000,
-              "Godot 未连接。请打开 Godot 编辑器并启用 godot-mcp 插件。"
-            )
-          );
-        }
-        return;
-      }
-    }
-  }
-
-  // ---- 通知（无 id） ----
-
-  if (method === "notifications/initialized") {
-    // initialized 通知：静默接受，如果 Godot 在线则转发
-    if (godotSocket && !godotSocket.destroyed) {
+  // ---- 通知 ----
+  if (id === undefined || id === null) {
+    if (method === "notifications/initialized") {
+      if (godotSocket && !godotSocket.destroyed) sendToGodot(JSON.stringify(msg));
+    } else if (godotSocket && !godotSocket.destroyed) {
       sendToGodot(JSON.stringify(msg));
     }
-    // 不在线也 OK，bridge 已经处理了 initialize
     return;
   }
 
-  // 其他通知：如果 Godot 在线则转发
-  if (godotSocket && !godotSocket.destroyed) {
-    sendToGodot(JSON.stringify(msg));
+  // ---- 请求 ----
+  switch (method) {
+    case "initialize":
+      writeStdout(
+        makeResponse(id, {
+          protocolVersion: "2025-03-26",
+          capabilities: { tools: { listChanged: true } },
+          serverInfo: { name: "godot-mcp", version: "0.1.0" },
+          instructions:
+            "Godot 编辑器 MCP Bridge。" +
+            (godotSocket
+              ? " ✅ 已连接，共 " + _cachedTools.length + " 个工具可用。"
+              : " ⚠️ 未连接 Godot。打开编辑器并启用 godot-mcp 插件后工具将自动加载。"),
+        })
+      );
+      return;
+
+    case "tools/list":
+      writeStdout(makeResponse(id, { tools: _cachedTools }));
+      return;
+
+    case "tools/call":
+      _handleToolCall(id, params);
+      return;
+
+    case "ping":
+      writeStdout(makeResponse(id, {}));
+      return;
+
+    default:
+      if (godotSocket && !godotSocket.destroyed) {
+        sendToGodot(JSON.stringify(msg));
+      } else {
+        writeStdout(makeError(id, -32000, "Godot 未连接。请打开 Godot 编辑器并启用 godot-mcp 插件。"));
+      }
   }
-  // 不在线则静默丢弃
 }
 
-// ---------------------------------------------------------------------------
+function _handleToolCall(id, params) {
+  const toolName = params?.name || "";
+
+  // bridge 自维护的元工具
+  if (toolName === "godot_status") {
+    const ok = !!(godotSocket && !godotSocket.destroyed);
+    writeStdout(
+      makeToolOk(
+        id,
+        JSON.stringify(
+          {
+            connected: ok,
+            port: PORT,
+            toolsCount: _cachedTools.length,
+            message: ok ? "Godot 已连接，MCP 服务正常。" : "Godot 未连接。请打开 Godot 并启用 godot-mcp 插件。",
+          },
+          null,
+          2
+        )
+      )
+    );
+    return;
+  }
+
+  // 其他工具 → 转发 Godot
+  if (godotSocket && !godotSocket.destroyed) {
+    sendToGodot(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params }));
+    return;
+  }
+
+  // Godot 不在线
+  writeStdout(
+    makeToolErr(
+      id,
+      "❌ 无法执行工具 **" +
+        toolName +
+        "**：Godot 编辑器未运行或 godot-mcp 插件未启用。\n\n" +
+        "请：1. 打开 Godot 并载入项目  2. 项目设置 → 插件 → 启用 godot-mcp  3. 调用 godot_status 确认连接"
+    )
+  );
+}
+
+// ============================================================================
 // 启动
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 function main() {
-  // 立即尝试连接 Godot
   connectToGodot();
 
-  // 从 stdin 读取 VS Code 发来的 JSON-RPC 消息
-  const rl = createInterface({
-    input: process.stdin,
-    output: undefined,
-    terminal: false,
-  });
+  const rl = createInterface({ input: process.stdin, output: undefined, terminal: false });
 
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-
     try {
-      const msg = JSON.parse(trimmed);
-      handleVsCodeMessage(msg);
+      handleVsCodeMessage(JSON.parse(trimmed));
     } catch {
       warn("无法解析 stdin 消息: " + trimmed.substring(0, 100));
     }
   });
 
-  rl.on("close", () => {
-    shutdown();
-  });
-
-  // 优雅退出
+  rl.on("close", () => shutdown());
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-  process.on("exit", () => {
-    if (godotSocket) godotSocket.destroy();
-  });
+  process.on("exit", () => { if (godotSocket) godotSocket.destroy(); });
 }
 
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  if (reconnectTimer) {
-    clearInterval(reconnectTimer);
-    reconnectTimer = null;
-  }
-  if (godotSocket) {
-    godotSocket.destroy();
-    godotSocket = null;
-  }
+  if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
+  if (godotSocket) { godotSocket.destroy(); godotSocket = null; }
   process.exit(0);
 }
 
