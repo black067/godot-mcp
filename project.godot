@@ -14,7 +14,3 @@ config/name="godot-mcp-dev"
 config/description="Godot MCP Plugin 开发项目"
 config/version="0.1.0"
 config/features=PackedStringArray("4.6")
-
-[editor_plugins]
-
-enabled=PackedStringArray("res://addons/godot-mcp/plugin.cfg")

@@ -33,6 +33,7 @@ import { connect } from "node:net";
 const DEFAULT_PORT = 8765;
 const GODOT_HOST = "127.0.0.1";
 const RECONNECT_INTERVAL_MS = 3000;
+const MAX_RECONNECT_ATTEMPTS = 10;
 
 function parsePort(args) {
   const portIdx = args.indexOf("--port");
@@ -54,6 +55,7 @@ let godotSocket = null;
 /** @type {Buffer} */
 let godotBuffer = Buffer.alloc(0);
 let reconnectTimer = null;
+let reconnectAttempts = 0;
 let shuttingDown = false;
 let wasConnected = false;
 
@@ -121,6 +123,7 @@ function connectToGodot() {
 
   sock.on("connect", () => {
     wasConnected = true;
+    reconnectAttempts = 0;
     godotSocket = sock;
     godotBuffer = Buffer.alloc(0);
     if (reconnectTimer) {
@@ -158,32 +161,52 @@ function connectToGodot() {
   });
 
   sock.on("close", () => {
-    if (wasConnected) warn("Godot 连接断开，将在 " + RECONNECT_INTERVAL_MS / 1000 + "s 后重试");
     godotSocket = null;
     godotBuffer = Buffer.alloc(0);
     _onGodotDisconnected();
-    scheduleReconnect();
+    if (!_tryScheduleReconnect("Godot 连接断开")) return;
+    if (wasConnected) warn("Godot 连接断开，将在 " + RECONNECT_INTERVAL_MS / 1000 + "s 后重试（剩余 " + (MAX_RECONNECT_ATTEMPTS - reconnectAttempts) + " 次）");
   });
 
   sock.on("error", (err) => {
-    if (err.code !== "ECONNREFUSED") warn("连接 Godot 时出错: " + err.message);
     godotSocket = null;
     godotBuffer = Buffer.alloc(0);
     _onGodotDisconnected();
-    scheduleReconnect();
+    if (!_tryScheduleReconnect(err.code === "ECONNREFUSED" ? "" : "连接 Godot 时出错: " + err.message)) return;
+    if (err.code !== "ECONNREFUSED") warn("连接 Godot 时出错: " + err.message + "，将在 " + RECONNECT_INTERVAL_MS / 1000 + "s 后重试（剩余 " + (MAX_RECONNECT_ATTEMPTS - reconnectAttempts) + " 次）");
   });
 }
 
-function scheduleReconnect() {
-  if (shuttingDown || reconnectTimer) return;
+/** 尝试调度重连。返回 true 表示已调度，false 表示已达上限。 */
+function _tryScheduleReconnect(reason) {
+  if (shuttingDown) return false;
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    warn("已重试 " + MAX_RECONNECT_ATTEMPTS + " 次，停止重连。" + (reason ? " 原因: " + reason : ""));
+    return false;
+  }
+  reconnectAttempts++;
+  if (reconnectTimer) return true; // 已有定时器在跑
   reconnectTimer = setInterval(() => {
     if (godotSocket && !godotSocket.destroyed) {
       clearInterval(reconnectTimer);
       reconnectTimer = null;
       return;
     }
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      clearInterval(reconnectTimer);
+      reconnectTimer = null;
+      warn("已重试 " + MAX_RECONNECT_ATTEMPTS + " 次，停止重连。");
+      return;
+    }
+    reconnectAttempts++;
     connectToGodot();
   }, RECONNECT_INTERVAL_MS);
+  return true;
+}
+
+/** @deprecated 请使用 _tryScheduleReconnect */
+function scheduleReconnect() {
+  _tryScheduleReconnect("");
 }
 
 function sendToGodot(jsonStr) {
