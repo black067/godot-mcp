@@ -30,15 +30,15 @@ flowchart TB
   subgraph Godot["Godot Editor"]
     subgraph Plugin["godot-mcp (EditorPlugin)"]
       TCP["TCPServer :8765"]
-      Router["MCP Router<br/>JSON-RPC 2.0"]
-      Handlers["Tool Handlers<br/>• 编辑器 UI 遍历<br/>• 场景树访问<br/>• 属性读写<br/>• UI 交互触发<br/>• 视口截图<br/>• 文件系统操作"]
-      TCP -->|消息转发| Router
-      Router -->|分发调用| Handlers
+      Server["mcp_server.gd<br/>TCP 帧 + JSON-RPC 路由<br/>+ 14 个工具实现"]
+      Picker["picker_overlay.gd<br/>UI 拾取覆盖层<br/>(hover 高亮 + 点击获取路径)"]
+      TCP -->|消息转发| Server
     end
   end
 
   subgraph VSCode["VS Code"]
     Agent["MCP Client + Agent"]
+    Bridge["bridge.mjs<br/>智能代理：缓存工具列表<br/>Godot 离线时独立响应"]
   end
 
   Developer((开发者))
@@ -238,6 +238,31 @@ GUT（`bitwes/Gut`）通过 `addons/gut/gut_cmdln.gd` 提供 CLI 入口。在 go
 - 提供 `dry_run` 模式：Agent 先描述要做什么，用户确认后再执行
 - 所有修改通过 `EditorUndoRedoManager`，用户可撤销
 - 可选的"需要确认"配置项
+
+---
+
+## 当前实现状态（2026-06-12）
+
+### 架构
+
+- **单文件工具实现**：`mcp_server.gd` 含 TCP Server + JSON-RPC 路由 + 14 个工具（四层）
+- **智能桥接**：`bridge.mjs` 缓存工具列表，Godot 离线时独立响应
+- **UI 拾取器**：`picker_overlay.gd`（`class_name PickerOverlay`），hover 金色描边高亮
+
+### Playwright 式工具分层
+
+| 层 | 工具 | 用途 |
+|---|---|---|
+| Perception | `screenshot` `get_scene_tree` `get_editor_ui_tree` `find_editor_ui_element` `pick_ui_element` | 看见界面 |
+| Action | `click_element` `type_text` `press_key` `hover_element` `drag_element` | 操作界面 |
+| Escape | `run_gdscript` | 任意表达式 |
+| Scene | `select_node` `get_node_properties` `set_node_property` | 场景操作 |
+
+### 关键引擎源码发现
+
+- `Viewport.push_input()` 对主 Window 可用，对 2D/3D SubViewport 无效（SubViewport 不含编辑器 UI）
+- `Expression` 不支持 `var` 声明、`if`/`for` 等语句，带命名输入时会丢失全局类访问
+- `Window::_can_consume_input_events()` 检查 `exclusive_child` 不为空时阻断输入
 
 ---
 

@@ -1,67 +1,79 @@
 # godot-mcp
 
-在 Godot 编辑器内部运行的 MCP Server（EditorPlugin），使 VS Code Agent 能够直接感知和操作 Godot 编辑器。
+Godot 编辑器内的 MCP Server（EditorPlugin），让 VS Code Agent 像 Playwright 操控网页一样操控 Godot。
 
-## 核心理念
+## 工作模型
 
-- **Agent 看到用户看到的**：编辑器布局、场景树、Inspector 属性、视口内容、文件系统等
-- **Agent 操作用户能操作的**：点击按钮、修改属性、选择节点、打开脚本、运行场景等
-- **不硬编码**所有编辑器操作——Agent 通过 MCP 获取编辑器 UI 结构后自主决策，就像人看界面一样
+> **定位 → 操作 → 验证**（Playwright 风格）
 
-## 架构
-
-- **语言**：GDScript EditorPlugin
-- **协议**：MCP（JSON-RPC 2.0 over TCP）
-- **传输**：TCP（默认 `127.0.0.1:8765`），使用 Content-Length 头帧格式
-- **Godot 版本**：4.6+
+Agent 不依赖预设的语义工具，而是感知编辑器 UI 结构后自行组合底层操作原语完成任务——就像人看着界面操作一样。
 
 ## 安装
 
-1. 将 `addons/godot-mcp/` 复制到你的 Godot 项目的 `addons/` 目录
-2. 在 Godot 编辑器中：项目 → 项目设置 → 插件 → 启用 `godot-mcp`
-3. 在 VS Code 中配置 MCP Client 连接到 `127.0.0.1:8765`
+1. 将 `addons/godot-mcp/` 复制到项目的 `addons/` 目录
+2. Godot 中：**项目 → 项目设置 → 插件** → 启用 `godot-mcp`
+3. VS Code 中配置 MCP 连接（见下方）
 
-### VS Code MCP 配置示例
+### VS Code MCP 配置
 
 ```json
 {
     "mcpServers": {
         "godot": {
-            "url": "http://127.0.0.1:8765",
-            "transport": "http"
+            "command": "node",
+            "args": ["bridge/bridge.mjs"]
         }
     }
 }
 ```
 
-## 项目设置
+Bridge 自动连接 Godot（默认 `127.0.0.1:8765`），Godot 离线时也能独立响应 `initialize`/`ping`。
 
-| 设置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `godot_mcp/port` | `8765` | TCP 监听端口 |
-| `godot_mcp/require_confirm` | `true` | 修改操作是否需要用户确认 |
-| `godot_mcp/auth_token` | `""` | 可选的身份验证 token |
+### 端口配置
+
+在 `project.godot` 中设置：
+
+```ini
+[godot_mcp]
+port=8765
+```
+
+## 工具
+
+| 层 | 工具 | 说明 |
+|---|---|---|
+| **Perception** | `get_scene_tree` | 获取场景节点树 |
+| | `get_editor_ui_tree` | 获取编辑器 UI 控件树 |
+| | `find_editor_ui_element` | 按名称/类名搜索 UI 控件 |
+| | `screenshot` | 截取编辑器视口（Base64 PNG） |
+| | `pick_ui_element` | 点击任意控件获取路径（也支持菜单手动激活） |
+| **Action** | `click_element` | 点击 UI 控件 |
+| | `type_text` | 向控件输入文本 |
+| | `press_key` | 模拟按键/组合键 |
+| | `hover_element` | 鼠标悬停 |
+| | `drag_element` | 拖拽控件 |
+| **Escape** | `run_gdscript` | 执行任意 GDScript 表达式 |
+| **Scene** | `select_node` | 选中场景节点 |
+| | `get_node_properties` | 读取节点属性 |
+| | `set_node_property` | 修改节点属性 |
 
 ## 项目结构
 
 ```
-├── bridge/                  # Node.js 桥接脚本（TCP ↔ stdio）
-│   └── bridge.mjs           # MCP 协议转发桥
-├── addons/godot-mcp/        # Godot EditorPlugin（GDScript）
-│   ├── plugin.gd            # 插件主入口
-│   ├── mcp_server.gd        # TCP Server + Content-Length 帧
-│   ├── mcp_router.gd        # JSON-RPC 2.0 路由
-│   ├── mcp_protocol.gd      # 消息构造 + MCP 常量
-│   └── tools/               # 工具模块
-├── docs/                    # 设计文档
-├── .vscode/mcp.json         # VS Code MCP 配置
-├── project.godot            # Godot 项目文件（开发用）
+├── bridge/bridge.mjs         # Node.js MCP 桥接代理
+├── addons/godot-mcp/         # Godot EditorPlugin
+│   ├── plugin.cfg            # 插件清单
+│   ├── plugin.gd             # 主入口 + 菜单
+│   ├── mcp_server.gd         # TCP Server + 全部工具实现
+│   └── picker_overlay.gd     # UI 拾取覆盖层（hover 高亮 + 点击）
+├── docs/                     # 设计文档
+├── project.godot             # 开发用 Godot 项目
 └── README.md
 ```
 
 ## 开发
 
-本项目本身也是一个 Godot 项目。用 Godot 编辑器打开此目录即可开发和调试插件。
+用 Godot 4.6+ 打开此目录即可开发和调试。
 
 ## 许可
 

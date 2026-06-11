@@ -13,6 +13,7 @@ config_version=5
 config/name="godot-mcp-dev"
 config/description="Godot MCP Plugin 开发项目"
 config/version="0.1.0"
+run/main_scene="uid://cudo0du7eboce"
 config/features=PackedStringArray("4.6")
 
 [editor_plugins]
