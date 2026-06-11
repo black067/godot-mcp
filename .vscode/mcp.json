@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "godot-mcp": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${workspaceFolder}/bridge/bridge.mjs",
+        "127.0.0.1",
+        "8765"
+      ],
+      "env": {}
+    }
+  }
+}

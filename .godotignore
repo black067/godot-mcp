@@ -1,0 +1,8 @@
+# Node.js 桥接脚本（非 Godot 资源）
+bridge/
+
+# VS Code 配置
+.vscode/
+
+# 设计文档（可选，如需要可在 Godot 中查看 docs/ 则移除）
+# docs/
